@@ -3,3 +3,8 @@ Library
 Logs
 Temp
 *.dwlt
+.vsconfig
+*.csproj
+obj
+.vs
+*.sln
