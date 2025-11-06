@@ -258,7 +258,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::FaceDetector
   modelAsset: {fileID: 5022602860645237092, guid: 6164fd25351e00840ae4945e17baa071, type: 3}
-  texture: {fileID: 2800000, guid: 48ef045ef6b598b488c392dacfbd9cc3, type: 3}
+  inputTexture: {fileID: 2800000, guid: 48ef045ef6b598b488c392dacfbd9cc3, type: 3}
+  scoreThreshold: 0.5
+  nmsThreshold: 0.4
 --- !u!1 &526366139
 GameObject:
   m_ObjectHideFlags: 0
