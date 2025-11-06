@@ -1,17 +1,31 @@
 using System;
 using System.Collections.Generic;
 using Unity.InferenceEngine;
-using Unity.Mathematics; 
+using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 using UnityEngine.UI;
 
 public class FaceDetectionAndAlignment : MonoBehaviour
 {
     public Texture2D inputImage;           // 原始输入图像
-    public ModelAsset detectionModel;      // det_10g.onnx
-    public ModelAsset landmarkModel;       // 2d106det.onnx
+    public ModelAsset detectionModelAsset;      // det_10g.onnx
+    public ModelAsset landmarkModelAsset;       // 2d106det.onnx
 
     public RawImage debugOutput;           // 用于显示对齐后人脸
+
+    public Model detectionModel;
+    public Worker detectionWorker;
+    public Model landmarkModel;
+    public Worker landmarkWorker;
+
+    [Serializable]
+    public class FaceResult
+    {
+        public float score;
+        public Rect bbox;
+        public float2[] landmarks5; // 5 points: LE, RE, Nose, LM, RM
+    }
 
     // 标准 5 点（128x128）
     static readonly float2[] s_standard5Points = {
@@ -33,11 +47,22 @@ public class FaceDetectionAndAlignment : MonoBehaviour
     void Start()
     {
         if (inputImage == null) return;
+
+        detectionModel = ModelLoader.Load(detectionModelAsset);
+        detectionWorker = new Worker(detectionModel, BackendType.GPUCompute);
+
+        landmarkModel = ModelLoader.Load(landmarkModelAsset);
+        landmarkWorker = new Worker(landmarkModel, BackendType.GPUCompute);
+
         var faces = DetectAndAlignFaces(inputImage);
         if (faces.Count > 0)
         {
             var aligned = AlignFace(inputImage, faces[0].landmarks5, 128);
             debugOutput.texture = aligned;
+        }
+        else
+        {
+            Debug.Log("no face");
         }
     }
 
@@ -47,6 +72,10 @@ public class FaceDetectionAndAlignment : MonoBehaviour
 
         // Step 1: 人脸检测
         var detections = RunFaceDetection(image);
+        foreach (var detection in detections)
+        {
+            Debug.Log(detection.score + " " + detection.bbox + " " + detection.score);
+        }
         foreach (var det in detections)
         {
             // Step 2: 关键点检测（裁剪人脸区域）
@@ -67,49 +96,95 @@ public class FaceDetectionAndAlignment : MonoBehaviour
         return faces;
     }
 
+    const int inputSize = 640;
     // ===== 1. 人脸检测 =====
-    List<(Rect bbox, float score)> RunFaceDetection(Texture2D image)
+    List<FaceResult> RunFaceDetection(Texture2D image)
     {
-        const int inputSize = 640;
-        var model = ModelLoader.Load(detectionModel);
-        using var worker = new Worker( model, BackendType.GPUCompute);
-
         // 预处理：缩放到 640x640，归一化 [0,1]
-        var resized = ResizeTexture(image, inputSize, inputSize);
-        var inputTensor = TextureToTensorNCHW(resized, 1f); // [1,3,640,640], [0,1]
-        worker.SetInput("input", inputTensor);
-        worker.Schedule();
-        var output = worker.PeekOutput("output") as Tensor<float>;
-        var scores = output.DownloadToArray();
-
-        // 后处理：解析输出（简化版，仅取高分框）
-        var results = new List<(Rect, float)>();
-        int numAnchors = output.shape[1]; // e.g., 16800
-
-        for (int i = 0; i < numAnchors; i++)
+        var resized = Tools.ResizeTexture(image, inputSize, inputSize);
+        var inputTensor = Tools.TextureToTensorNCHW(resized, 255f); // [1,3,640,640], [0,1]
+        detectionWorker.SetInput(0, inputTensor);
+        detectionWorker.Schedule();
+        var outputs = new Tensor<float>[9];
+        for (int i = 0; i < 9; i++)
         {
-            float score = scores[i * 15 + 4]; // 第5个是置信度
-            if (score > 0.7f)
+            outputs[i] = detectionWorker.PeekOutput(i) as Tensor<float>;
+            outputs[i].ReadbackAndClone();
+        }
+        var allScores = new List<float>();
+        var allBoxes = new List<float4>();
+        var allKpss = new List<float2[]>();
+
+        int[] strides = { 8, 16, 32 };
+        for (int i = 0; i < 3; i++)
+        {
+            var scores = outputs[i * 3 + 0];
+            var bboxes = outputs[i * 3 + 1];
+            var kpss = outputs[i * 3 + 2];
+
+            int stride = strides[i];
+            int H = inputSize / stride; // e.g., 80, 40, 20
+            int W = H;
+
+            var anchorCenters = GenerateAnchorCenters(H, W, stride); // 长度 = H*W*2
+
+            // ✅ 传入 H, W
+            var boxes = Distance2BBox(anchorCenters, bboxes.DownloadToArray(), H, W, stride);
+            var keypoints = Distance2Kps(anchorCenters, kpss.DownloadToArray(), H, W, stride);
+
+            // scores: [1, 2, H, W]
+            var scoreArray = scores.DownloadToArray();
+            for (int a = 0; a < 2; a++)
             {
-                float x1 = scores[i * 15 + 0];
-                float y1 = scores[i * 15 + 1];
-                float x2 = scores[i * 15 + 2];
-                float y2 = scores[i * 15 + 3];
-
-                // 转换为原始图像坐标（注意：模型输入是 640x640）
-                float scaleX = (float)image.width / inputSize;
-                float scaleY = (float)image.height / inputSize;
-
-                Rect bbox = new Rect(
-                    x1 * scaleX, y1 * scaleY,
-                    (x2 - x1) * scaleX, (y2 - y1) * scaleY
-                );
-
-                results.Add((bbox, score));
+                for (int h = 0; h < H; h++)
+                {
+                    for (int w = 0; w < W; w++)
+                    {
+                        int idx = (a * H + h) * W + w;
+                        float score = scoreArray[(a * H + h) * W + w]; // 注意：scores 也是 NCHW
+                        if (score > 0.5f)
+                        {
+                            allScores.Add(score);
+                            allBoxes.Add(boxes[idx]);
+                            allKpss.Add(keypoints[idx]);
+                        }
+                    }
+                }
             }
         }
 
-        // 可加 NMS（此处省略）
+        // 转换为 Unity 坐标（640x640 -> 原图）
+        var results = new List<FaceResult>();
+        float scaleX = (float)image.width / inputSize;
+        float scaleY = (float)image.height / inputSize;
+
+        for (int i = 0; i < allScores.Count; i++)
+        {
+            var score = allScores[i];
+            var box = allBoxes[i];
+            var kps = allKpss[i];
+
+            // bbox
+            Rect bbox = new Rect(
+                box.x * scaleX,
+                box.y * scaleY,
+                (box.z - box.x) * scaleX,
+                (box.w - box.y) * scaleY
+            );
+
+            // 5 points (kps 是 10 个值: x0,y0,x1,y1,...x4,y4)
+            float2[] lm5 = new float2[5];
+            for (int j = 0; j < 5; j++)
+            {
+                lm5[j] = new float2(
+                    kps[j].x * scaleX,
+                    kps[j].y * scaleY
+                );
+            }
+
+            results.Add(new FaceResult { score = score, bbox = bbox, landmarks5 = lm5 });
+        }
+
         return results;
     }
 
@@ -117,15 +192,18 @@ public class FaceDetectionAndAlignment : MonoBehaviour
     float2[] RunLandmarkDetection(Texture2D faceCrop)
     {
         const int inputSize = 192;
-        var model = ModelLoader.Load(landmarkModel);
-        using var worker = new Worker(model,BackendType.GPUCompute );
 
-        var resized = ResizeTexture(faceCrop, inputSize, inputSize);
-        var inputTensor = TextureToTensorNCHW(resized, 255f); // 注意：2d106det 通常用 [0,255]
+        var resized = Tools.ResizeTexture(faceCrop, inputSize, inputSize);
+        var inputTensor = Tools.TextureToTensorNCHW(resized, 1f); // 注意：2d106det 通常用 [0,255]
 
-        worker.SetInput("input", inputTensor);
-        worker.Schedule();
-        var output = worker.PeekOutput("output") as Tensor<float>;
+        landmarkWorker.SetInput("data", inputTensor);
+        landmarkWorker.Schedule();
+        var output = landmarkWorker.PeekOutput() as Tensor<float>;
+        //var fgrAwaiter = output.ReadbackAndCloneAsync().GetAwaiter();
+        //while (!fgrAwaiter.IsCompleted)
+        //{
+
+        //}
         var data = output.DownloadToArray();
 
         var points = new float2[106];
@@ -265,75 +343,138 @@ public class FaceDetectionAndAlignment : MonoBehaviour
         );
     }
 
-    // 工具函数：缩放纹理
-    Texture2D ResizeTexture(Texture2D source, int width, int height)
-    {
-        var rt = RenderTexture.GetTemporary(width, height);
-        Graphics.Blit(source, rt);
-        var dest = new Texture2D(width, height);
-        RenderTexture.active = rt;
-        dest.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-        dest.Apply();
-        RenderTexture.active = null;
-        RenderTexture.ReleaseTemporary(rt);
-        return dest;
-    }
-
-    // 工具函数：Texture -> Tensor (NCHW)
-    Tensor<float> TextureToTensorNCHW(Texture2D tex, float div)
-    {
-        var pixels = tex.GetPixels32();
-        int w = tex.width, h = tex.height;
-        var data = new float[1 * 3 * h * w];
-        int i = 0;
-        for (int y = h - 1; y >= 0; y--)
-        {
-            for (int x = 0; x < w; x++)
-            {
-                var p = pixels[y * w + x];
-                data[i++] = p.r / div;
-                data[i++] = p.g / div;
-                data[i++] = p.b / div;
-            }
-        }
-        return new Tensor<float>(new TensorShape(1, 3, h, w), data);
-    }
-
-    // 工具函数：裁剪人脸区域
+    // 工具函数：裁剪人脸区域（CPU 实现）
     Texture2D CropFace(Texture2D src, Rect rect, int size)
     {
-        // 扩展 bbox 以包含更多上下文（可选）
-        float cx = rect.x + rect.width / 2;
-        float cy = rect.y + rect.height / 2;
+        // 扩展边界框
+        float cx = rect.x + rect.width / 2f;
+        float cy = rect.y + rect.height / 2f;
         float scale = 1.3f;
         float w = rect.width * scale;
         float h = rect.height * scale;
 
-        Rect cropRect = new Rect(cx - w / 2, cy - h / 2, w, h);
-        cropRect.x = Mathf.Max(0, cropRect.x);
-        cropRect.y = Mathf.Max(0, cropRect.y);
-        cropRect.width = Mathf.Min(src.width - cropRect.x, cropRect.width);
-        cropRect.height = Mathf.Min(src.height - cropRect.y, cropRect.height);
+        Rect cropRect = new Rect(cx - w / 2f, cy - h / 2f, w, h);
+        // 限制在图像内
+        cropRect.x = Mathf.Clamp(cropRect.x, 0, src.width);
+        cropRect.y = Mathf.Clamp(cropRect.y, 0, src.height);
+        cropRect.width = Mathf.Clamp(cropRect.width, 0, src.width - cropRect.x);
+        cropRect.height = Mathf.Clamp(cropRect.height, 0, src.height - cropRect.y);
 
-        var rt = RenderTexture.GetTemporary(size, size);
-        var prev = RenderTexture.active;
-        RenderTexture.active = rt;
+        int cropW = Mathf.Max(1, Mathf.RoundToInt(cropRect.width));
+        int cropH = Mathf.Max(1, Mathf.RoundToInt(cropRect.height));
 
-        GL.PushMatrix();
-        GL.LoadPixelMatrix(0, size, size, 0);
-        Graphics.DrawTexture(new Rect(0, 0, size, size), src, new Rect(
-            cropRect.x / src.width, 
-            cropRect.y / src.height, 
-            cropRect.width / src.width, 
-            cropRect.height / src.height));
-        GL.PopMatrix();
+        // 裁剪像素
+        Color[] pixels = src.GetPixels(
+            Mathf.RoundToInt(cropRect.x),
+            Mathf.RoundToInt(cropRect.y),
+            cropW,
+            cropH
+        );
 
-        var cropped = new Texture2D(size, size);
-        cropped.ReadPixels(new Rect(0, 0, size, size), 0, 0);
+        Texture2D cropped = new Texture2D(cropW, cropH, TextureFormat.RGB24, false);
+        cropped.SetPixels(pixels);
         cropped.Apply();
 
-        RenderTexture.active = prev;
-        RenderTexture.ReleaseTemporary(rt);
-        return cropped;
+        // 缩放到目标尺寸
+        return Tools.ResizeTexture(cropped, size, size);
+    }
+
+    // 生成 anchor centers: (H*W*2, 2)
+    float2[] GenerateAnchorCenters(int H, int W, int stride)
+    {
+        var centers = new List<float2>();
+        for (int h = 0; h < H; h++)
+        {
+            for (int w = 0; w < W; w++)
+            {
+                float cy = (h + 0.5f) * stride;
+                float cx = (w + 0.5f) * stride;
+                // 重复两次（num_anchors=2）
+                centers.Add(new float2(cx, cy));
+                centers.Add(new float2(cx, cy));
+            }
+        }
+        return centers.ToArray();
+    }
+
+    // distance2kps: 输入 distance [N,10], 输出 5 个点 [(x,y), ...]
+    float2[][] Distance2Kps(float2[] centers, float[] preds, int H, int W, int stride)
+    {
+        int numAnchors = 2;
+        int total = H * W * numAnchors;
+        var kpss = new float2[total][];
+
+        // preds shape: [1, 20, H, W] → 20 = numAnchors * 10 (5 points × 2)
+        for (int a = 0; a < numAnchors; a++)
+        {
+            for (int h = 0; h < H; h++)
+            {
+                for (int w = 0; w < W; w++)
+                {
+                    int idx = (a * H + h) * W + w;
+                    float cx = centers[idx].x;
+                    float cy = centers[idx].y;
+
+                    var points = new float2[5];
+                    int baseChan = a * 10;
+                    for (int p = 0; p < 5; p++)
+                    {
+                        float dx = preds[(baseChan + p * 2 + 0) * H * W + h * W + w] * stride;
+                        float dy = preds[(baseChan + p * 2 + 1) * H * W + h * W + w] * stride;
+                        points[p] = new float2(cx + dx, cy + dy);
+                    }
+                    kpss[idx] = points;
+                }
+            }
+        }
+        return kpss;
+    }
+
+    // distance2bbox: 输入 distance [N,4], 输出 [x1,y1,x2,y2]
+    float4[] Distance2BBox(float2[] centers, float[] preds, int H, int W, int stride)
+    {
+        int numAnchors = 2;
+        int total = H * W * numAnchors;
+        var boxes = new float4[total];
+
+        // preds shape: [1, 8, H, W] → 8 = numAnchors * 4
+        // 所以 preds 有 8 个通道：C0~C7
+        // C0~C3: anchor0 (dx1, dy1, dx2, dy2)
+        // C4~C7: anchor1 (dx1, dy1, dx2, dy2)
+
+        for (int a = 0; a < numAnchors; a++)
+        {
+            for (int h = 0; h < H; h++)
+            {
+                for (int w = 0; w < W; w++)
+                {
+                    int idx = (a * H + h) * W + w; // centers 的索引
+                    float cx = centers[idx].x;
+                    float cy = centers[idx].y;
+
+                    // 通道偏移：每个 anchor 占 4 个通道
+                    int baseChan = a * 4;
+                    // 通道内的空间偏移：C × H × W + h × W + w
+                    float dx1 = preds[(baseChan + 0) * H * W + h * W + w] * stride;
+                    float dy1 = preds[(baseChan + 1) * H * W + h * W + w] * stride;
+                    float dx2 = preds[(baseChan + 2) * H * W + h * W + w] * stride;
+                    float dy2 = preds[(baseChan + 3) * H * W + h * W + w] * stride;
+
+                    float x1 = cx - dx1;
+                    float y1 = cy - dy1;
+                    float x2 = cx + dx2;
+                    float y2 = cy + dy2;
+
+                    boxes[idx] = new float4(x1, y1, x2, y2);
+                }
+            }
+        }
+        return boxes;
+    }
+
+    private void OnDestroy()
+    {
+        detectionWorker?.Dispose();
+        landmarkWorker?.Dispose();
     }
 }
